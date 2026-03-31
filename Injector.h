@@ -1,10 +1,11 @@
-#pragma once
+ragma once
 
 #include <iostream>
 #include <Windows.h>
 #include <tlhelp32.h>
 #include <vector>
 #include <processthreadsapi.h>
+#include <string.h>  
 
 
 
@@ -73,14 +74,23 @@ class Injector {
 
 	}
 
-	static PVOID ThreadInjection(DWORD ThID) {
+	static PVOID ThreadInjection(DWORD ThID, DWORD entryPoint) {
 		HANDLE ct = OpenThread(THREAD_ALL_ACCESS, true, ThID); 
 
 		if (!SuspendThread(&ct) > -1) {                                                /* NEED TO ADD THIS FUCKING ERROR HANDLING */
 			std::cout << "failed to Suspend Thread" << std::endl;
 		}
+
+
+
 		_CONTEXT ctx;
+		ctx.ContextFlags = CONTEXT_FULL;
+
+		GetThreadContext(&ct, &ctx);
 		ctx.Rip = NULL; // needs to be replaced to our code pointer or reference (would prefer reference -> &) incase the pointer is NULL for x reasons.
+		ctx.Rcx = (DWORD64)entryPoint; // entryPoint
+		ctx.Rdx = DLL_PROCESS_ATTACH; // FdwReason =  1
+		ctx.R8 = NULL; // LpReserved 
 
 
 		if (SetThreadContext(&ct, &ctx) == NULL) {
@@ -95,11 +105,101 @@ class Injector {
 
 	}
 
-	static PVOID ManualMap(std::vector<DWORD>tb) { /* Need to finish this tommorow */
+	static DWORD ManualMap(std::vector<BYTE>tb, HANDLE ThreadHandle) { /* Need to finish this tommorow */
+
+		/* Walking DosHeaders and NtHeaders of our dll Bytes */
+
+		IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)tb.data();
+		IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(tb.data() + dos->e_lfanew);
+
+		/* Allocating for it*/
+
+		LPVOID alloc = VirtualAllocEx(ThreadHandle, NULL, nt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+		/* Walking into all the sections */
+
+		PIMAGE_SECTION_HEADER ntH = (PIMAGE_SECTION_HEADER)nt;
+
+
+		for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+			memmove(ThreadHandle, (BYTE*)alloc + ntH[i].VirtualAddress, nt->OptionalHeader.SizeOfImage);
+		}
+
+		/* Fixing relocations */
+
+		DWORD delta = (uintptr_t)alloc - nt->OptionalHeader.ImageBase;
+
+
+		PIMAGE_DATA_DIRECTORY dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+
+		PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(nt->OptionalHeader.ImageBase + dir->VirtualAddress);
+
+		while (reloc->VirtualAddress != 0) {
+			DWORD size = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+			PWORD relocentry = (PWORD)(reloc + 1);
+
+			for (DWORD i = 0; i < size; i++) {
+				WORD test = relocentry[i] >> 12; // Page Offset Table ( pml4 -> pdpt -> pd -> pt -> PageOffSetTable )
+				WORD tt = relocentry[i] & 0x0FFF;
+
+				if (test == IMAGE_REL_BASED_HIGHLOW || test == IMAGE_REL_BASED_DIR64) {
+					uintptr_t* correctBase = (uintptr_t*)(&alloc + reloc->VirtualAddress + tt);
+
+					*correctBase += delta;
+				}
+
+
+			}
+
+
+		}
+
+		reloc = (PIMAGE_BASE_RELOCATION)((BYTE*)reloc + reloc->SizeOfBlock); // Next Block To fix
+
+
+		/* Fixing Imports */
+
+		
+		IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]; /* Importing Import Directory */
+		PIMAGE_IMPORT_DESCRIPTOR desc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)alloc + dir->VirtualAddress); /* Moving through it */
+
+
+		const char* dll = (char*)(BYTE*)alloc + desc->Name;
+		HMODULE handle = LoadLibraryA(dll);
+
+		while (!handle) {
+			desc++;
+			if (handle) {
+				break;
+			}
+		}
+
+		PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)alloc + desc->OriginalFirstThunk);
+		PIMAGE_THUNK_DATA IAT = (PIMAGE_THUNK_DATA)((BYTE*)alloc + desc->FirstThunk);
+
+		while(thunk->u1.AddressOfData != 0) { 
+		if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) { /* if it's set, import by ordinal, else import by name.*/
+			WORD ordinal = IMAGE_ORDINAL(thunk->u1.Ordinal);
+
+			IAT->u1.Function = (ULONG_PTR)GetProcAddress(handle, (LPCSTR)ordinal);
+		}
+		else {
+			PIMAGE_IMPORT_BY_NAME name = (PIMAGE_IMPORT_BY_NAME)((BYTE*)alloc + thunk->u1.AddressOfData);
+			char* funcname = name->Name;
+
+			IAT->u1.Function = (ULONG_PTR)GetProcAddress(handle, (LPCSTR)funcname);
+		}
+		thunk++; /*  original thunk of the import (ILT)*/
+		IAT++; /* First thunk of the import*/
+		}
+		desc++; /* Next Import */
+
+
+
+		BYTE EntryPoint = (BYTE)(&alloc + nt->OptionalHeader.AddressOfEntryPoint);
+		
+		return EntryPoint;
 
 	}
 
-
-
 };
-
